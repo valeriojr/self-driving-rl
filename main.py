@@ -1,33 +1,188 @@
-import cv2
+import collections
+import statistics
+from datetime import datetime
+from typing import Tuple, List
+
+import gymnasium as gym
 import numpy
+import tensorflow as tf
+import tensorflow.python.keras as keras
+import tensorflow.python.keras.layers as layers
+import tensorflow.python.keras.losses as losses
+import tensorflow.python.keras.utils.losses_utils as losses_utils
+import tqdm
 
-import environment
+import self_driving_car
 
-FRAMEBUFFER_SIZE = (1280, 720)
 
-if __name__ == '__main__':
-    agents = 10
-    speed_action_count = 5
-    steering_action_count = 5
+# Wrap Gym's `env.step` call as an operation in a TensorFlow function.
+# This would allow it to be included in a callable TensorFlow graph.
+def env_step(action: numpy.ndarray) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+    """Returns state, reward and done flag given an action."""
+    state, reward, done, truncated, info = env.step(action)
+    if truncated:
+        reward += env.vehicle.position.z
+    return state.astype(numpy.float32), numpy.array(float(reward), numpy.int32), numpy.array(done, numpy.int32)
 
-    env = environment.Environment(agents, FRAMEBUFFER_SIZE)
 
-    env.reset()
+def tf_env_step(action: tf.Tensor) -> List[tf.Tensor]:
+    return tf.numpy_function(env_step, [action],
+                             [tf.float32, tf.int32, tf.int32])
 
-    while not env.window.is_closing:
-        a = numpy.random.randint(low=(0, 0), high=(speed_action_count, steering_action_count),
-                                 size=(agents, 2)).transpose()
-        a = (a - 2) / 2
-        action = numpy.rec.fromarrays(a, dtype=[('speed', numpy.float32), ('steering', numpy.float32)])
 
-        state, done = env.step(action, timestep=0.032)
+def run_episode(initial_state: tf.Tensor, model: tf.keras.Model, max_steps: int) -> Tuple[
+    tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Runs a single episode to collect training data."""
 
-        env.render()
+    action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+    values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
+    rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
 
-        # for i in range(agents):
-        #     cv2.imshow(f'Agent {i}', state[i])
-        # key = cv2.waitKey(16)
-        # if key == 27:
-        #     env.close()
-        #     break
+    initial_state_shape = initial_state.shape
+    state = initial_state
 
+    for t in tf.range(max_steps):
+        state = tf.expand_dims(state, 0)
+        action_logits_t, value = model(state)
+
+        action = tf.random.categorical(action_logits_t, 1)[0, 0]
+        action_probs_t = tf.nn.softmax(action_logits_t)
+
+        values = values.write(t, tf.squeeze(value))
+        action_probs = action_probs.write(t, action_probs_t[0, action])
+
+        state, reward, done = tf_env_step(action)
+        state.set_shape(initial_state_shape)
+
+        rewards = rewards.write(t, reward)
+
+        if tf.cast(done, tf.bool):
+            break
+
+    action_probs = action_probs.stack()
+    values = values.stack()
+    rewards = rewards.stack()
+
+    return action_probs, values, rewards
+
+
+def get_expected_return(rewards: tf.Tensor, gamma: float, standardize: bool = True) -> tf.Tensor:
+    """Compute expected returns per timestep."""
+
+    n = tf.shape(rewards)[0]
+    returns = tf.TensorArray(dtype=tf.float32, size=n)
+
+    # Start from the end of `rewards` and accumulate reward sums
+    # into the `returns` array
+    rewards = tf.cast(rewards[::-1], dtype=tf.float32)
+    discounted_sum = tf.constant(0.0)
+    discounted_sum_shape = discounted_sum.shape
+    for i in tf.range(n):
+        reward = rewards[i]
+        discounted_sum = reward + gamma * discounted_sum
+        discounted_sum.set_shape(discounted_sum_shape)
+        returns = returns.write(i, discounted_sum)
+    returns = returns.stack()[::-1]
+
+    if standardize:
+        returns = ((returns - tf.math.reduce_mean(returns)) /
+                   (tf.math.reduce_std(returns) + epsilon))
+
+    return returns
+
+
+def compute_loss(action_probs: tf.Tensor, values: tf.Tensor,
+                 returns: tf.Tensor) -> tf.Tensor:
+    """Computes the combined Actor-Critic loss."""
+
+    advantage = returns - values
+
+    action_log_probs = tf.math.log(action_probs)
+    actor_loss = -tf.math.reduce_sum(action_log_probs * advantage)
+
+    critic_loss = huber_loss(values, returns)
+
+    return actor_loss + critic_loss
+
+
+@tf.function
+def train_step(initial_state: tf.Tensor, model: tf.keras.Model, optimizer: tf.keras.optimizers.Optimizer, gamma: float, max_steps_per_episode: int) -> tf.Tensor:
+    with tf.GradientTape() as tape:
+        action_probs, values, rewards = run_episode(initial_state, model, max_steps_per_episode)
+        returns = get_expected_return(rewards, gamma)
+        action_probs, values, returns = [tf.expand_dims(x, 1) for x in [action_probs, values, returns]]
+
+        computed_loss = compute_loss(action_probs, values, returns)
+
+    grads = tape.gradient(computed_loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+    return tf.math.reduce_sum(rewards)
+
+
+def create_model(num_hidden_units, num_actions):
+    state = keras.Input(shape=self_driving_car.STATE_SHAPE)
+
+    x = layers.Conv2D(filters=16, kernel_size=(3, 3))(state)
+    x = layers.MaxPool2D()(x)
+    x = layers.Conv2D(input_shape=self_driving_car.STATE_SHAPE, filters=16, kernel_size=(3, 3))(x)
+    x = layers.MaxPool2D()(x)
+    x = layers.Conv2D(input_shape=self_driving_car.STATE_SHAPE, filters=16, kernel_size=(3, 3))(x)
+    x = layers.MaxPool2D()(x)
+    x = layers.Flatten()(x)
+    x = layers.Dense(units=num_hidden_units)(x)
+
+    actor = layers.Dense(num_actions)(x)
+    critic = layers.Dense(units=1)(x)
+
+    return keras.Model(inputs=[state], outputs=[actor, critic])
+
+
+epsilon = numpy.finfo(numpy.float32).eps.item()
+seed = 42
+learning_rate = 0.01
+gamma = 0.99
+min_episodes_criterion = 100
+max_episodes = 50000
+max_steps_per_episode = 1000
+reward_threshold = 8.0
+
+tf.random.set_seed(seed)
+numpy.random.seed(seed)
+env = gym.make('SelfDrivingCar-v0', render_mode='human', scene_name='env_basic.obj',
+               max_episode_steps=max_steps_per_episode)
+
+num_actions = env.action_space.n  # 2
+num_hidden_units = 128
+model = create_model(num_hidden_units, num_actions)
+huber_loss = losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
+optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+model.compile()
+
+# Keep the last episodes reward
+episodes_reward = collections.deque(maxlen=min_episodes_criterion)
+
+current_time = datetime.now().strftime('%d%m%Y-%H%M%S')
+train_log_dir = 'results/' + current_time + '/train'
+test_log_dir = 'results/' + current_time + '/test'
+train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+test_summary_writer = tf.summary.create_file_writer(test_log_dir)
+
+t = tqdm.trange(max_episodes)
+for i in t:
+    initial_state, info = env.reset()
+    initial_state = tf.constant(initial_state, dtype=tf.float32)
+    episode_reward = float(train_step(initial_state, model, optimizer, gamma, max_steps_per_episode))
+
+    episodes_reward.append(episode_reward)
+    running_reward = statistics.mean(episodes_reward)
+
+    with train_summary_writer.as_default():
+        tf.summary.scalar('Reward', episode_reward, step=i + 1)
+
+    if i % 100 == 99:
+        model.save(f'model.h5')
+
+    if running_reward > reward_threshold and i >= min_episodes_criterion:
+        print(f'\nSolved at episode {i}: average reward: {running_reward:.2f}!')
+        break

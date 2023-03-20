@@ -8,5 +8,6 @@ out vec3 f_color;
 uniform sampler2D albedo;
 
 void main() {
-    f_color = texture(albedo, vec2(v_uv.x, -v_uv.y)).rgb * v_tint.rgb;
+    // f_color = texture(albedo, vec2(v_uv.x, -v_uv.y)).rgb * v_tint.rgb;
+    f_color = vec3(1.0);
 }

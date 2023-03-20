@@ -1,12 +1,7 @@
-glcontext==2.3.7
-glfw==2.5.5
 moderngl==5.7.4
-moderngl-window==2.4.2
-multipledispatch==0.6.0
 numpy==1.24.1
 opencv-python==4.7.0.68
-Pillow==9.3.0
-pyglet==2.0.2.1
-PyGLM==2.6.0
 pyrr==0.10.3
-six==1.16.0
+gymnasium~=0.27.1
+tensorflow~=2.10.0
+tqdm~=4.64.1
