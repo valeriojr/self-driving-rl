@@ -9,7 +9,6 @@ import tensorflow as tf
 import tensorflow.python.keras as keras
 import tensorflow.python.keras.layers as layers
 import tensorflow.python.keras.losses as losses
-import tensorflow.python.keras.utils.losses_utils as losses_utils
 import tqdm
 
 import self_driving_car
@@ -22,12 +21,12 @@ def env_step(action: numpy.ndarray) -> Tuple[numpy.ndarray, numpy.ndarray, numpy
     state, reward, done, truncated, info = env.step(action)
     if truncated:
         reward += env.vehicle.position.z
-    return state.astype(numpy.float32), numpy.array(float(reward), numpy.int32), numpy.array(done, numpy.int32)
+    return *state, numpy.array(reward, numpy.float32), numpy.array(done, numpy.int32)
 
 
 def tf_env_step(action: tf.Tensor) -> List[tf.Tensor]:
     return tf.numpy_function(env_step, [action],
-                             [tf.float32, tf.int32, tf.int32])
+                             [tf.uint8, tf.float32, tf.float32, tf.int32])
 
 
 def run_episode(initial_state: tf.Tensor, model: tf.keras.Model, max_steps: int) -> Tuple[
@@ -36,14 +35,14 @@ def run_episode(initial_state: tf.Tensor, model: tf.keras.Model, max_steps: int)
 
     action_probs = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
     values = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
-    rewards = tf.TensorArray(dtype=tf.int32, size=0, dynamic_size=True)
+    rewards = tf.TensorArray(dtype=tf.float32, size=0, dynamic_size=True)
 
-    initial_state_shape = initial_state.shape
-    state = initial_state
+    camera, vehicle_state = initial_state
+    initial_state_shape = camera.shape
 
     for t in tf.range(max_steps):
-        state = tf.expand_dims(state, 0)
-        action_logits_t, value = model(state)
+        # state = tf.expand_dims(state, 0)
+        action_logits_t, value = model([tf.expand_dims(camera, axis=0), tf.expand_dims(vehicle_state, axis=0)])
 
         action = tf.random.categorical(action_logits_t, 1)[0, 0]
         action_probs_t = tf.nn.softmax(action_logits_t)
@@ -51,10 +50,13 @@ def run_episode(initial_state: tf.Tensor, model: tf.keras.Model, max_steps: int)
         values = values.write(t, tf.squeeze(value))
         action_probs = action_probs.write(t, action_probs_t[0, action])
 
-        state, reward, done = tf_env_step(action)
-        state.set_shape(initial_state_shape)
+        camera, vehicle_state, reward, done = tf_env_step(action)
+        camera.set_shape(initial_state_shape)
+        vehicle_state.set_shape((2,))
+        # state.set_shape(initial_state_shape)
 
         rewards = rewards.write(t, reward)
+        env.render()
 
         if tf.cast(done, tf.bool):
             break
@@ -62,6 +64,9 @@ def run_episode(initial_state: tf.Tensor, model: tf.keras.Model, max_steps: int)
     action_probs = action_probs.stack()
     values = values.stack()
     rewards = rewards.stack()
+
+    with train_summary_writer.as_default():
+        tf.summary.image('Camera', [camera])
 
     return action_probs, values, rewards
 
@@ -105,8 +110,9 @@ def compute_loss(action_probs: tf.Tensor, values: tf.Tensor,
     return actor_loss + critic_loss
 
 
-@tf.function
-def train_step(initial_state: tf.Tensor, model: tf.keras.Model, optimizer: tf.keras.optimizers.Optimizer, gamma: float, max_steps_per_episode: int) -> tf.Tensor:
+# @tf.function
+def train_step(initial_state: tf.Tensor, model: tf.keras.Model, optimizer: tf.keras.optimizers.Optimizer, gamma: float,
+               max_steps_per_episode: int) -> tf.Tensor:
     with tf.GradientTape() as tape:
         action_probs, values, rewards = run_episode(initial_state, model, max_steps_per_episode)
         returns = get_expected_return(rewards, gamma)
@@ -121,21 +127,23 @@ def train_step(initial_state: tf.Tensor, model: tf.keras.Model, optimizer: tf.ke
 
 
 def create_model(num_hidden_units, num_actions):
-    state = keras.Input(shape=self_driving_car.STATE_SHAPE)
+    camera = keras.Input(shape=self_driving_car.STATE_SHAPE)
+    vehicle_state = keras.Input(shape=2)
 
-    x = layers.Conv2D(filters=16, kernel_size=(3, 3))(state)
+    x = layers.Conv2D(filters=16, kernel_size=(3, 3), activation='relu')(camera)
     x = layers.MaxPool2D()(x)
-    x = layers.Conv2D(input_shape=self_driving_car.STATE_SHAPE, filters=16, kernel_size=(3, 3))(x)
+    x = layers.Conv2D(filters=16, kernel_size=(3, 3), activation='relu')(x)
     x = layers.MaxPool2D()(x)
-    x = layers.Conv2D(input_shape=self_driving_car.STATE_SHAPE, filters=16, kernel_size=(3, 3))(x)
+    x = layers.Conv2D(filters=16, kernel_size=(3, 3), activation='relu')(x)
     x = layers.MaxPool2D()(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(units=num_hidden_units)(x)
+    x = layers.Concatenate()([x, vehicle_state])
+    x = layers.Dense(units=num_hidden_units, activation='relu')(x)
 
-    actor = layers.Dense(num_actions)(x)
+    actor = layers.Dense(num_actions, activation='softmax')(x)
     critic = layers.Dense(units=1)(x)
 
-    return keras.Model(inputs=[state], outputs=[actor, critic])
+    return keras.Model(inputs=[camera, vehicle_state], outputs=[actor, critic])
 
 
 epsilon = numpy.finfo(numpy.float32).eps.item()
@@ -143,9 +151,10 @@ seed = 42
 learning_rate = 0.01
 gamma = 0.99
 min_episodes_criterion = 100
-max_episodes = 50000
-max_steps_per_episode = 1000
+max_episodes = 10000
+max_steps_per_episode = 800
 reward_threshold = 8.0
+model_checkpoint = 25
 
 tf.random.set_seed(seed)
 numpy.random.seed(seed)
@@ -153,16 +162,18 @@ env = gym.make('SelfDrivingCar-v0', render_mode='human', scene_name='env_basic.o
                max_episode_steps=max_steps_per_episode)
 
 num_actions = env.action_space.n  # 2
-num_hidden_units = 128
+num_hidden_units = 32
 model = create_model(num_hidden_units, num_actions)
+print(model.summary())
 huber_loss = losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
 optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 model.compile()
 
 # Keep the last episodes reward
 episodes_reward = collections.deque(maxlen=min_episodes_criterion)
+episodes_trajectory = collections.deque(maxlen=10)
 
-current_time = datetime.now().strftime('%d%m%Y-%H%M%S')
+current_time = datetime.now().strftime('%d-%b-%Y_%H-%M-%S')
 train_log_dir = 'results/' + current_time + '/train'
 test_log_dir = 'results/' + current_time + '/test'
 train_summary_writer = tf.summary.create_file_writer(train_log_dir)
@@ -170,18 +181,21 @@ test_summary_writer = tf.summary.create_file_writer(test_log_dir)
 
 t = tqdm.trange(max_episodes)
 for i in t:
+    tf.summary.experimental.set_step(i)
+    episode = i + 1
+
     initial_state, info = env.reset()
-    initial_state = tf.constant(initial_state, dtype=tf.float32)
+    # initial_state = tf.ragged.constant(initial_state, dtype=tf.float32)
     episode_reward = float(train_step(initial_state, model, optimizer, gamma, max_steps_per_episode))
 
     episodes_reward.append(episode_reward)
     running_reward = statistics.mean(episodes_reward)
 
     with train_summary_writer.as_default():
-        tf.summary.scalar('Reward', episode_reward, step=i + 1)
+        tf.summary.scalar('Reward', episode_reward, step=episode)
 
-    if i % 100 == 99:
-        model.save(f'model.h5')
+    if i % model_checkpoint == model_checkpoint - 1:
+        model.save(train_log_dir + '/model.h5')
 
     if running_reward > reward_threshold and i >= min_episodes_criterion:
         print(f'\nSolved at episode {i}: average reward: {running_reward:.2f}!')
