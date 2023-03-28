@@ -19,8 +19,8 @@ import self_driving_car
 def env_step(action: numpy.ndarray) -> Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]:
     """Returns state, reward and done flag given an action."""
     state, reward, done, truncated, info = env.step(action)
-    if truncated:
-        reward += env.vehicle.position.z
+    if done or truncated:
+        reward = env.vehicle.position.z
     return *state, numpy.array(reward, numpy.float32), numpy.array(done, numpy.int32)
 
 
@@ -139,9 +139,10 @@ def create_model(num_hidden_units, num_actions):
     x = layers.Flatten()(x)
     x = layers.Concatenate()([x, vehicle_state])
     x = layers.Dense(units=num_hidden_units, activation='relu')(x)
+    x = layers.Dense(units=num_hidden_units, activation='relu')(x)
 
     actor = layers.Dense(num_actions, activation='softmax')(x)
-    critic = layers.Dense(units=1)(x)
+    critic = layers.Dense(units=1, activation='linear')(x)
 
     return keras.Model(inputs=[camera, vehicle_state], outputs=[actor, critic])
 
@@ -185,7 +186,6 @@ for i in t:
     episode = i + 1
 
     initial_state, info = env.reset()
-    # initial_state = tf.ragged.constant(initial_state, dtype=tf.float32)
     episode_reward = float(train_step(initial_state, model, optimizer, gamma, max_steps_per_episode))
 
     episodes_reward.append(episode_reward)

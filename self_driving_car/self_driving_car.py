@@ -257,7 +257,7 @@ class Road:
 class SelfDrivingCar(gymnasium.Env):
     metadata = {
         'render_modes': ['human', 'rgb_array', 'state_pixels'],
-        'render_fps': 60,
+        'render_fps': 1
     }
 
     def __init__(self, render_mode=None, scene_name=None, timestep=0.1):
@@ -268,13 +268,13 @@ class SelfDrivingCar(gymnasium.Env):
             moderngl_window.settings.WINDOW['class'] = 'moderngl_window.context.glfw.Window'
             moderngl_window.settings.WINDOW['glVersion'] = (4, 1)
             moderngl_window.settings.WINDOW['size'] = (640, 480)
+            moderngl_window.settings.WINDOW['vsync'] = False
             self.window = moderngl_window.create_window_from_settings()
             self.context = self.window.ctx
 
             self.camera = scene.Camera(aspect_ratio=self.window.aspect_ratio, fov=45.0, near=0.01, far=1000.0)
             self.camera.set_position(0, 4, 0)
             self.camera.set_rotation(-90.0, -25.0)
-
         else:
             self.context = moderngl.create_standalone_context()
 
@@ -375,6 +375,8 @@ class SelfDrivingCar(gymnasium.Env):
         return observation, info
 
     def step(self, action):
+        start_time = time.time()
+
         # Apply action
         assert self.vehicle is not None
         if action is not None:
@@ -385,22 +387,18 @@ class SelfDrivingCar(gymnasium.Env):
         self.start_time = time.time()
 
         reward = 0.0
-        if plate_position.x >= 0.0:
-            reward += 0.01 * numpy.cos(self.vehicle.angle)
-
-        if len(self.position_history) > 0:
-            if plate_position.x < 0.0 < self.position_history[-1].x:
-                reward += -20.0
-            elif self.position_history[-1].x < 0.0 < plate_position.x:
-                reward += 5.0
+        # if plate_position.x >= 0.0:
+        #     reward += 0.01 * numpy.cos(self.vehicle.angle)
+        #
+        # if len(self.position_history) > 0:
+        #     if plate_position.x < 0.0 < self.position_history[-1].x:
+        #         reward += -20.0
+        #     elif self.position_history[-1].x < 0.0 < plate_position.x:
+        #         reward += 5.0
 
         done = False
-        if abs(plate_position.x) > self.road.lane_width:
+        if abs(plate_position.x) > self.road.lane_width or abs(self.vehicle.angle) > radians(30):
             done = True
-            if plate_position.x < 0.0:
-                reward += self.vehicle.position.z - 100.0
-            else:
-                reward += self.vehicle.position.z - 30.0  # Replace with "Out of Bounds" reward
 
         observation = self._get_obs()
         info = self._get_info()
